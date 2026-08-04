@@ -9,6 +9,17 @@ Every agent call goes through here. This class owns:
   - routing task type -> model
   - safe concurrency: an asyncio.Semaphore limits how many real HTTP
     calls are in flight at once, independent of the token bucket
+  - event publishing: every call publishes cache hits, throttle waits,
+    and completions to backend/events.py's event bus. The run_id comes
+    from core/run_context.py's contextvar, set once at the top of
+    agents/graph.py's run_review() — no function signature in between
+    needs to know about it. If no run_id is set (e.g. any standalone
+    test script from Phases 0-5), events are silently skipped.
+
+  Cache hits ALSO report tpd_spent (cumulative daily spend), not just
+  llm_call_complete — otherwise a fully-cached run (zero real API
+  calls) would leave the frontend's budget bar stuck at whatever it
+  last saw, since cache_hit used to carry no budget info at all.
 
 If you ever see `client.chat.completions.create(...)` outside this file,
 the design is broken.
@@ -31,13 +42,8 @@ from core.config import (
     BACKOFF_MULTIPLIER,
 )
 from core.models import TaskType, resolve_model
+from core.run_context import current_run_id
 
-# Max real HTTP calls in flight at once, across ALL agents. LangGraph can
-# run 4 specialist nodes "in parallel," but 4 concurrent 2K-token calls
-# would be the entire per-minute token budget at once. The token bucket
-# already blocks correctly for sync code, but blocking inside
-# asyncio.gather serializes badly — this semaphore gives the gateway an
-# explicit, visible cap on real concurrency instead.
 MAX_CONCURRENT_CALLS = 2
 
 
@@ -47,32 +53,24 @@ class GatewayError(Exception):
 
 
 def _estimate_tokens(text: str, max_tokens: int) -> int:
-    """
-    Rough estimate: prompt chars / CHARS_PER_TOKEN_ESTIMATE, plus the
-    response's max_tokens ceiling. Good enough for pre-call budgeting —
-    actual usage always comes from the response afterward.
-    """
     prompt_tokens = int(len(text) / CHARS_PER_TOKEN_ESTIMATE)
     return prompt_tokens + max_tokens
 
 
+def _publish(event_type: str, data: dict) -> None:
+    """
+    Publishes an event only if a run_id is currently set in context.
+    Lazy import of backend.events keeps core/ usable standalone for any
+    script that never sets a run_id — nothing from Phases 0-5 breaks.
+    """
+    run_id = current_run_id.get()
+    if run_id is None:
+        return
+    from backend.events import event_bus
+    event_bus.publish(run_id, event_type, data)
+
+
 class LLMGateway:
-    """
-    Usage (sync):
-        gateway = LLMGateway()
-        response = gateway.call(
-            task_type=TaskType.SPECIALIST,
-            system_prompt="...",      # static
-            schema_prompt="...",       # static
-            few_shot="...",             # static
-            variable_content="...",      # changes per call — MUST be last
-            max_tokens=300,
-        )
-
-    Usage (async, for parallel specialist fan-out in Phase 3+):
-        response = await gateway.acall(task_type=..., ...)
-    """
-
     def __init__(self, api_key: str | None = None):
         self._client = Groq(api_key=api_key or os.environ.get("GROQ_API_KEY"))
         self._bucket = TokenBucket()
@@ -91,11 +89,6 @@ class LLMGateway:
         temperature: float = 0.0,
         reasoning_effort: str = "low",
     ) -> dict:
-        """
-        Synchronous entry point — used by Phase 2 nodes and anywhere
-        outside an async graph. No semaphore involved here since sync
-        calls are inherently sequential already.
-        """
         model = resolve_model(task_type)
         messages, params = self._build_request(
             system_prompt, schema_prompt, few_shot, variable_content, max_tokens, temperature, reasoning_effort
@@ -103,13 +96,20 @@ class LLMGateway:
 
         cached = self._cache.get(model, messages, params)
         if cached is not None:
+            _publish("cache_hit", {"model": model, "tpd_spent": self._ledger.spent_today(model)})
             return {**cached, "cached": True}
 
         full_text = system_prompt + schema_prompt + few_shot + variable_content
         estimated = _estimate_tokens(full_text, max_tokens)
 
         self._ledger.check_budget(model, estimated)
+
+        _publish("llm_call_start", {"model": model})
+        wait_start = time.monotonic()
         self._bucket.wait_if_needed(model, estimated)
+        wait_elapsed = time.monotonic() - wait_start
+        if wait_elapsed > 0.5:
+            _publish("throttle_wait", {"model": model, "seconds": round(wait_elapsed, 1)})
 
         response = self._call_with_retry(model, messages, params)
 
@@ -117,6 +117,12 @@ class LLMGateway:
         self._bucket.record_usage(model, actual_tokens)
         self._ledger.record(model, actual_tokens)
         self._cache.set(model, messages, params, response)
+
+        _publish("llm_call_complete", {
+            "model": model,
+            "tokens": actual_tokens,
+            "tpd_spent": self._ledger.spent_today(model),
+        })
 
         return {**response, "cached": False}
 
@@ -131,16 +137,6 @@ class LLMGateway:
         temperature: float = 0.0,
         reasoning_effort: str = "low",
     ) -> dict:
-        """
-        Async entry point — used when multiple specialists run concurrently
-        via asyncio.gather (Phase 3+). Wraps the same logic as call(), but
-        the actual network request is gated by self._semaphore so at most
-        MAX_CONCURRENT_CALLS real HTTP calls are ever in flight, no matter
-        how many specialists "fire" at once in the graph.
-
-        Cache/budget/bucket checks happen OUTSIDE the semaphore — a cache
-        hit shouldn't wait in line behind real network calls.
-        """
         model = resolve_model(task_type)
         messages, params = self._build_request(
             system_prompt, schema_prompt, few_shot, variable_content, max_tokens, temperature, reasoning_effort
@@ -148,6 +144,7 @@ class LLMGateway:
 
         cached = self._cache.get(model, messages, params)
         if cached is not None:
+            _publish("cache_hit", {"model": model, "tpd_spent": self._ledger.spent_today(model)})
             return {**cached, "cached": True}
 
         full_text = system_prompt + schema_prompt + few_shot + variable_content
@@ -155,17 +152,27 @@ class LLMGateway:
 
         self._ledger.check_budget(model, estimated)
 
+        _publish("llm_call_start", {"model": model})
+
         async with self._semaphore:
-            # wait_if_needed is a blocking sleep — run it in a thread so
-            # it doesn't block the whole event loop while one call waits
-            # out the rate-limit window.
+            wait_start = time.monotonic()
             await asyncio.to_thread(self._bucket.wait_if_needed, model, estimated)
+            wait_elapsed = time.monotonic() - wait_start
+            if wait_elapsed > 0.5:
+                _publish("throttle_wait", {"model": model, "seconds": round(wait_elapsed, 1)})
+
             response = await asyncio.to_thread(self._call_with_retry, model, messages, params)
 
         actual_tokens = response["usage"]["total_tokens"]
         self._bucket.record_usage(model, actual_tokens)
         self._ledger.record(model, actual_tokens)
         self._cache.set(model, messages, params, response)
+
+        _publish("llm_call_complete", {
+            "model": model,
+            "tokens": actual_tokens,
+            "tpd_spent": self._ledger.spent_today(model),
+        })
 
         return {**response, "cached": False}
 
@@ -179,12 +186,6 @@ class LLMGateway:
         temperature: float,
         reasoning_effort: str,
     ) -> tuple[list[dict], dict]:
-        """
-        Fixed order is mandatory for prompt caching: static content
-        first (system, schema, few-shot), variable content last.
-        Groq doesn't count cached-prefix tokens against rate limits,
-        but only if the prefix is byte-identical across calls.
-        """
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "system", "content": schema_prompt},
@@ -230,17 +231,12 @@ class LLMGateway:
                     raise GatewayError(
                         f"429 from {model} after {MAX_RETRIES} retries: {e}"
                     ) from e
-                # Non-429 API error — don't retry, surface immediately.
                 raise GatewayError(f"API error from {model}: {e}") from e
 
         raise GatewayError(f"Exhausted retries calling {model}: {last_error}")
 
     @staticmethod
     def _parse_retry_after(error: APIStatusError) -> float:
-        """
-        Prefer the server's retry-after header. Fall back to exponential
-        backoff only if the header is missing.
-        """
         headers = getattr(error, "response", None)
         if headers is not None:
             retry_after = headers.headers.get("retry-after")
@@ -249,5 +245,4 @@ class LLMGateway:
                     return float(retry_after)
                 except ValueError:
                     pass
-        # Fallback exponential backoff.
         return BACKOFF_BASE_SECONDS * (BACKOFF_MULTIPLIER)

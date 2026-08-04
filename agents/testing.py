@@ -87,7 +87,10 @@ def testing_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
     for path in selected_paths:
         file_hunk = file_lookup[path]
         static_findings = static_by_file.get(path)
-        worker_findings = scan_file(file_hunk, gateway, focus_hint=TESTING_FOCUS_HINT, static_findings=static_findings)
+        worker_findings = scan_file(
+            file_hunk, gateway, focus_hint=TESTING_FOCUS_HINT,
+            static_findings=static_findings, specialist_name="testing",
+        )
         findings.extend(_tag_findings(worker_findings))
 
     return {"findings": findings}
@@ -114,6 +117,7 @@ async def atesting_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
             gateway,
             focus_hint=TESTING_FOCUS_HINT,
             static_findings=static_by_file.get(path),
+            specialist_name="testing",
         )
         for path in selected_paths
     ]

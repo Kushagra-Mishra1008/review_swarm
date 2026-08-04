@@ -89,7 +89,10 @@ def performance_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
     for path in selected_paths:
         file_hunk = file_lookup[path]
         static_findings = static_by_file.get(path)
-        worker_findings = scan_file(file_hunk, gateway, focus_hint=PERFORMANCE_FOCUS_HINT, static_findings=static_findings)
+        worker_findings = scan_file(
+            file_hunk, gateway, focus_hint=PERFORMANCE_FOCUS_HINT,
+            static_findings=static_findings, specialist_name="performance",
+        )
         findings.extend(_tag_findings(worker_findings))
 
     return {"findings": findings}
@@ -116,6 +119,7 @@ async def aperformance_specialist(state: ReviewState, gateway: LLMGateway) -> di
             gateway,
             focus_hint=PERFORMANCE_FOCUS_HINT,
             static_findings=static_by_file.get(path),
+            specialist_name="performance",
         )
         for path in selected_paths
     ]

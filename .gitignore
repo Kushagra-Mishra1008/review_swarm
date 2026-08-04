@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .cache/
 data/
+frontend/node_modules/
+frontend/dist/
+eval/data/
+backend/data/

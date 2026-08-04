@@ -88,10 +88,51 @@ def security_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
     for path in selected_paths:
         file_hunk = file_lookup[path]
         static_findings = static_by_file.get(path)
-        worker_findings = scan_file(file_hunk, gateway, focus_hint=SECURITY_FOCUS_HINT, static_findings=static_findings)
+        worker_findings = scan_file(
+            file_hunk, gateway, focus_hint=SECURITY_FOCUS_HINT,
+            static_findings=static_findings, specialist_name="security",
+        )
         findings.extend(_tag_findings(worker_findings))
 
     return {"findings": findings}
+
+
+async def asecurity_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
+    """
+    Async version — selects files (one LLM call, now with real code
+    content), then scans every selected file CONCURRENTLY via
+    asyncio.gather. Each ascan_file call queues behind the gateway's
+    semaphore, so real network concurrency stays capped.
+    """
+    if not state["files"]:
+        return {"findings": []}
+
+    selection = await _acall_file_selection(gateway, state["files"])
+    selected_paths = _resolve_selected_paths(selection, [f["file_path"] for f in state["files"]])
+
+    file_lookup = {f["file_path"]: f for f in state["files"]}
+    static_by_file = state.get("static_findings_by_file", {})
+
+    tasks = [
+        ascan_file(
+            file_lookup[path],
+            gateway,
+            focus_hint=SECURITY_FOCUS_HINT,
+            static_findings=static_by_file.get(path),
+            specialist_name="security",
+        )
+        for path in selected_paths
+    ]
+    results = await asyncio.gather(*tasks) if tasks else []
+
+    findings: list[Finding] = []
+    for worker_findings in results:
+        findings.extend(_tag_findings(worker_findings))
+
+    return {
+        "findings": findings,
+        "errors": [f"[diag] security selected files: {selected_paths}"],
+    }
 
 
 async def asecurity_specialist(state: ReviewState, gateway: LLMGateway) -> dict:

@@ -3,16 +3,15 @@ File Scanner worker — the narrow, cheap tier. One instance gets spawned
 per file a specialist wants inspected, running on gpt-oss-20b in a
 separate rate-limit pool from the 120b specialists.
 
-A worker does one thing: given a single file's diff hunk (plus optional
-focus hint and static-analysis evidence), look for concrete issues and
-return structured findings. No orchestration, no judgment about which
-specialists to run — that's the lead's job.
+Publishes worker_spawn/worker_complete events (via backend/events.py,
+through core/run_context.py's contextvar) so the frontend can show
+dynamic worker activity — these aren't fixed graph nodes, so they only
+show up as event-stream lines and a live per-specialist counter, not as
+static boxes in the agent graph.
 
 Both sync (scan_file) and async (ascan_file) versions exist: sync is
 used by Phase 2's single-specialist flow, async is used in Phase 3+
-when multiple specialists fan out concurrently via asyncio.gather and
-workers need to run under the gateway's semaphore rather than blocking
-each other.
+when multiple specialists fan out concurrently via asyncio.gather.
 """
 
 import json
@@ -22,6 +21,7 @@ from pydantic import BaseModel, Field, ValidationError
 from agents.state import Finding, FileHunk
 from core.gateway import LLMGateway
 from core.models import TaskType
+from core.run_context import current_run_id
 from tools.static_analysis import StaticFinding, format_evidence_for_prompt
 
 # --- Structured output schema -------------------------------------------
@@ -39,6 +39,16 @@ class WorkerOutput(BaseModel):
 
 
 VALID_SEVERITIES = {"blocker", "major", "minor", "nit"}
+
+
+def _publish_event(event_type: str, data: dict) -> None:
+    """Same lazy-import pattern as core/gateway.py and agents/graph.py."""
+    run_id = current_run_id.get()
+    if run_id is None:
+        return
+    from backend.events import event_bus
+    event_bus.publish(run_id, event_type, data)
+
 
 # --- Static prompt pieces -------------------------------------------------
 
@@ -77,19 +87,18 @@ def scan_file(
     gateway: LLMGateway,
     focus_hint: str | None = None,
     static_findings: list[StaticFinding] | None = None,
+    specialist_name: str | None = None,
 ) -> list[Finding]:
-    """
-    Synchronous version — used by Phase 2's single-specialist flow.
-    Returns an empty list (not an exception) on repeated validation
-    failure — one bad worker call should never crash the whole review.
-    """
+    """Synchronous version — used by Phase 2's single-specialist flow."""
+    file_path = file_hunk["file_path"]
+    _publish_event("worker_spawn", {"file": file_path, "specialist": specialist_name})
+
     variable_content = _build_variable_content(file_hunk, focus_hint, static_findings)
-
     output = _call_worker(gateway, variable_content)
-    if output is None:
-        return []
+    findings = _output_to_findings(output, file_path) if output else []
 
-    return _output_to_findings(output, file_hunk["file_path"])
+    _publish_event("worker_complete", {"file": file_path, "specialist": specialist_name, "finding_count": len(findings)})
+    return findings
 
 
 async def ascan_file(
@@ -97,20 +106,19 @@ async def ascan_file(
     gateway: LLMGateway,
     focus_hint: str | None = None,
     static_findings: list[StaticFinding] | None = None,
+    specialist_name: str | None = None,
 ) -> list[Finding]:
-    """
-    Async version — used when multiple specialists fan out concurrently
-    (Phase 3+). Calls gateway.acall() instead of gateway.call(), so this
-    worker's request queues behind the gateway's semaphore alongside
-    every other concurrent call, rather than blocking the event loop.
-    """
+    """Async version — used when multiple specialists fan out concurrently
+    (Phase 3+). Queues behind the gateway's semaphore via gateway.acall()."""
+    file_path = file_hunk["file_path"]
+    _publish_event("worker_spawn", {"file": file_path, "specialist": specialist_name})
+
     variable_content = _build_variable_content(file_hunk, focus_hint, static_findings)
-
     output = await _acall_worker(gateway, variable_content)
-    if output is None:
-        return []
+    findings = _output_to_findings(output, file_path) if output else []
 
-    return _output_to_findings(output, file_hunk["file_path"])
+    _publish_event("worker_complete", {"file": file_path, "specialist": specialist_name, "finding_count": len(findings)})
+    return findings
 
 
 def _output_to_findings(output: WorkerOutput, file_path: str) -> list[Finding]:
