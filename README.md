@@ -1,148 +1,175 @@
 # Autonomous Code Review Swarm
 
-A hierarchical multi-agent system that reviews GitHub pull requests and reports findings with file and line references — built to run inside a hard free-tier API budget of **30 requests/min and 8,000 tokens/min**.
+A hierarchical multi-agent system that reviews GitHub pull requests. Six agents
+across three tiers, coordinated by LangGraph, running entirely inside an 8K
+tokens-per-minute free-tier budget via a custom gateway.
 
-Six agent roles across three tiers, wired through LangGraph, fed by an AST-aware retrieval layer, with every model call routed through a single rate-limited, cached, budget-enforcing gateway. Includes an evaluation harness that scores the swarm against real human review comments and against a single-agent baseline.
-
-<!-- TODO: record a ~40s GIF of a review run (agent graph expanding, SSE event stream, token budget bar draining) and embed it here. This is the single highest-value addition to this README. -->
-<!-- ![Demo](docs/demo.gif) -->
-
-<!-- TODO: deploy frontend to Vercel in replay mode and link it here -->
-<!-- **[Live demo (replay mode)](#)** · -->
-**[Testbed repo with planted vulnerabilities](https://github.com/Kushagra-Mishra1008/review-swarm-testbed)**
-
----
-
-## Results
-
-Measured on a 10-file pull request, all calls inside the free-tier quota:
-
-| Metric | Value |
-|---|---|
-| Wall clock | 39.8s |
-| Tokens consumed | 9,897 |
-| Findings returned | 9 |
-| Rate-limit failures (429s) | 0 |
-
-Evaluated against **19 merged scikit-learn pull requests** with human review comments. A finding counts as a match if it lands in the same file, within ±3 lines, and is semantically similar to the human comment.
-
-| | Swarm | Single-agent baseline |
-|---|---|---|
-| Precision | **17.1%** | 9.8% |
-| Recall | 2.2% | **6.3%** |
-| Tokens per review | 3,168 | **1,196** |
-
-**Reading these honestly:** the swarm is meaningfully more precise — when it flags something, it is roughly twice as likely to match a real human comment. It is also worse on recall and about 2.6× more expensive per review. The hierarchical design buys signal quality, not coverage, and it buys it with tokens.
-
-Recall is low for both systems, and that number deserves a caveat rather than a spin: human reviewers comment on intent, API design, and project convention, much of which is not recoverable from a diff alone. The baseline's higher recall comes largely from casting a wider, noisier net. I report these numbers as measured rather than picking the framing that flatters the architecture.
+Evaluated against 19 merged scikit-learn PRs with real human review comments,
+and benchmarked against a single-agent baseline to test whether the
+architecture earns its complexity.
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    PR[Pull Request] --> LEAD[Lead Orchestrator<br/>gpt-oss-120b]
-    LEAD -->|activation rules| SEC[Security Specialist]
-    LEAD -->|activation rules| PERF[Performance Specialist]
-    LEAD -->|activation rules| TEST[Testing Specialist]
-    LEAD -->|activation rules| MAINT[Maintainability Specialist]
-    SEC --> W[Per-file Worker Agents<br/>gpt-oss-20b<br/>Semaphore=2]
-    PERF --> W
-    TEST --> W
-    MAINT --> W
-    W --> AGG[Aggregation + Dedup]
-    AGG --> OUT[Structured Findings<br/>Pydantic-validated]
-
-    LEAD -.all calls.-> GW[LLM Gateway]
-    SEC -.-> GW
-    W -.-> GW
-    GW -.-> BUDGET[Token bucket · Daily ledger · Disk cache · Model routing]
+```
+                         +--------------+
+                         |  Review Lead |   orchestration - 120b
+                         +------+-------+
+                                | triage: which specialists?
+          +-------------+-------+-------+-----------------+
+          |             |               |                 |
+     +----v----+   +----v-----+   +-----v------+   +------v--------+
+     |Security |   | Testing  |   |Performance |   |Maintainability|
+     +----+----+   +----+-----+   +-----+------+   +------+--------+
+          |             |               |                 |
+          +-------------+-------+-------+-----------------+
+                                | one worker per selected file
+                         +------v-------+
+                         | File Scanner |   worker - 20b
+                         +------+-------+
+                                |
+                    dedupe -> rank -> report
 ```
 
-**Three tiers, six roles:** a lead orchestrator triages the diff and decides which specialists are warranted; four domain specialists (security, performance, testing, maintainability) each define a focus; per-file worker agents do the actual line-level scanning and fan out concurrently.
+**Three tiers.** The Lead decides which specialists to wake. Specialists decide
+which files are worth scanning. Workers do the narrow per-file inspection on a
+cheaper model in a separate rate-limit pool.
 
-7 LangGraph nodes, 7 edges. Specialist selection happens inside the node body rather than through conditional edges, which keeps the graph flat and the routing logic inspectable in plain Python.
-
-7 Pydantic models define every structured output. No model response is trusted without validation.
-
----
-
-## The hard part: staying inside the budget
-
-This is the constraint the whole design bends around, and it's the part I'd point to first.
-
-A hierarchical fan-out naturally wants maximum concurrency — orchestrator, then four specialists, then one worker per changed file. On a free tier capped at 30 requests and 8,000 tokens per minute, naive parallelism trips the limit immediately and naive serialization turns a review into a multi-minute wait. Both obvious approaches fail.
-
-Every model call in the system goes through `core/gateway.py`. Nothing bypasses it. The gateway enforces:
-
-**Sliding 60-second token bucket** tracking requests *and* tokens independently. Exceeding either one fails a run, so both are first-class.
-
-**Pre-LLM activation rules** — three deterministic checks that skip specialists a diff doesn't warrant. A documentation-only change never wakes the security specialist. The cheapest call is the one never made, and this is plain Python, not a model decision.
-
-**Bounded concurrency** via `asyncio.Semaphore(2)`, capping in-flight calls so worker fan-out stays inside the window.
-
-**SHA-256-keyed disk cache** on prompt content, so re-runs over unchanged files cost nothing.
-
-**Two-tier model routing** across 4 task types — `gpt-oss-120b` for orchestration and specialist reasoning, `gpt-oss-20b` for per-file scanning and formatting. Mechanical work does not need the expensive model.
-
-**Persisted daily ledger** with a 90% soft cap on the daily token allowance, surviving process restarts so the budget is not re-spent after a crash.
-
-Retries are capped at 3 with a flat 2.0s delay between attempts. (Not exponential backoff — the variable naming in the code suggests otherwise and is misleading; fixing it is on the list below.)
+**Everything deterministic is plain Python.** Routing, filtering, dedupe,
+ranking, and diff parsing never touch an LLM. Static analysis (semgrep, ruff)
+runs first and its output is fed to specialists as evidence to judge, not as
+findings to trust.
 
 ---
 
-## Retrieval layer
+## Results
 
-Findings need surrounding context, and shipping whole files into prompts is not affordable under an 8K TPM ceiling.
+Measured across 19 merged scikit-learn PRs, each with substantive human review
+comments. A finding counts as a match when it lands on the same file as a human
+comment and the two are semantically similar (local MiniLM embeddings, 0.5
+cosine floor).
 
-- **tree-sitter AST-boundary chunking** on function and class nodes, no overlap — chunks land on real code boundaries instead of arbitrary character windows (Python only at present)
-- **ChromaDB** single `code_chunks` collection, embedded with `all-MiniLM-L6-v2` on local CPU — zero API cost for indexing
-- **Hybrid retrieval** fusing vector similarity with exact-match ripgrep search via reciprocal rank fusion (K=60)
-- **Incremental reindexing** keyed on file content hashes against a manifest, so only changed files are reprocessed and stale records are evicted
+| Metric | Swarm | Single-agent baseline |
+|---|---|---|
+| **Precision** | **17.3%** | 9.8% |
+| Recall | 2.5% | 6.3% |
+| Tokens per review | 4,026 | 1,196 |
+| Novel findings surfaced | 42 | — |
 
-Indexed 5,654 chunks from a production open-source codebase.
+**Precision is where the hierarchy pays off.** Roughly one in six swarm findings
+corresponds to something a human reviewer independently flagged, against one in
+ten for a single undifferentiated pass. Specialist focus hints and per-file
+worker scope produce findings that are more often about something that actually
+mattered.
+
+**Recall is lower, and the token cost is real.** The swarm recovers fewer human
+comments than the baseline while spending about 3.4x the tokens. On a codebase
+as dense as scikit-learn, narrow per-file scanning trades breadth for
+specificity. Reporting this rather than quietly dropping the baseline is the
+point of running one.
+
+**42 novel findings** — issues the swarm raised that no human commented on — are
+dumped to `eval/report.json` for manual inspection. A sample includes a function
+defined with no body (guaranteed `SyntaxError` on import), a missing closing
+paren in a test call, and several unguarded `None` concatenations.
+
+### Caveats
+
+The two precision figures are averaged over different denominators — swarm
+precision counts only PRs where it produced findings, baseline precision counts
+all of them — so the gap is directional rather than exact. The baseline also
+sees each file truncated to 400 characters while the swarm sees full hunks plus
+retrieval context, so it is not a like-for-like comparison. n=19, below the
+30-PR target. Token figures are approximate: cached gateway responses record
+zero usage, so per-review cost is understated on re-runs.
 
 ---
 
-## MCP layer
+## What measuring actually caught
 
-Three tools exposed over a **custom Model Context Protocol server** wrapping the retrieval layer:
+Building the eval harness surfaced three bugs that all reported "no issues
+found" rather than erroring — the worst possible failure mode for a review tool,
+because a silent pass is indistinguishable from a clean bill of health.
 
-- `search_code` — semantic + exact hybrid search
-- `find_callers` — call-site lookup
-- `get_definition` — symbol definition lookup
+1. **Findings dropped on off-spec severity strings.** Workers discarded any
+   finding whose severity didn't exactly match `blocker|major|minor|nit`. The
+   20b model returning `"Critical"` silently voided the finding. Now normalized
+   against an alias table.
 
-Consumed alongside the **official GitHub and Filesystem MCP servers**. All GitHub access was migrated to MCP — zero direct REST calls remain in the codebase.
+2. **Empty completions from exhausted reasoning budgets.** gpt-oss models emit
+   reasoning tokens that never appear in `content`. On large files the worker's
+   500-token ceiling was consumed entirely by reasoning, returning an empty
+   string that the parser rejected as malformed JSON. The gateway now detects
+   empty completions, retries once with a larger budget, and raises a named
+   error rather than passing an empty string downstream.
 
-Trade-off worth naming: the same 10-file PR takes 39.8s through direct calls and 105.9s through the MCP path, almost entirely Docker container startup overhead for the official servers. MCP bought protocol-level interoperability at a real latency cost.
+3. **Specialists selecting zero files.** A valid-but-empty file selection
+   spawned no workers, producing a zero-finding review that looked identical to
+   a clean PR. Empty selections now fall back to scanning everything.
+
+All three passed the synthetic test-bed gates. They only appeared against real
+repository code, where files are large enough to exhaust a token budget and
+ambiguous enough for a specialist to decline.
 
 ---
 
-## Frontend
+## Rate limits as a design constraint
 
-FastAPI backend serving 7 REST and server-sent-event endpoints, with a React (Vite) three-column interface:
+The entire system runs on Groq's free tier: **30 RPM, 8K TPM, 200K TPD** on
+`gpt-oss-120b`. Every LLM call in the codebase goes through a single
+`LLMGateway`. No agent ever touches the Groq client directly.
 
-- **Agent graph** — expandable cards per agent showing role, focus list, this-run activation decision, and live per-file worker list with count badges
-- **Event stream** — SSE feed of orchestration events as they happen
-- **Findings panel** — structured results with file and line references
-- **Live token budget bar** — the signature element; the remaining minute-window budget draining in real time as the swarm runs
+The gateway owns:
 
-Replay mode (`?replay=<run_id>`) re-streams a recorded run, so the system can be demonstrated without spending quota.
+- **Token bucket** — sliding 60-second window tracking tokens and requests per
+  model. Estimates before the call, records actual usage from the response after.
+- **Daily ledger** — JSON on disk, per model per calendar day, refusing calls
+  past 90% of TPD.
+- **Disk cache** — sha256 over model + messages + params. Cache hits return
+  instantly and record zero usage, which is what makes iterating on this
+  survivable.
+- **Cache-friendly prompt assembly** — static system prompt, static schema,
+  static few-shot, variable content last. Baked into the gateway so agents
+  can't get the ordering wrong.
+- **Concurrency cap** — `asyncio.Semaphore(2)` alongside the bucket. Specialists
+  fan out in parallel in the graph; the gateway quietly meters them so four
+  concurrent 2K-token calls never consume an entire minute's budget at once.
+
+Zero 429 errors across the full evaluation run.
 
 ---
 
-## Repo layout
+## MCP
 
-```
-core/         config, models, budget (TokenBucket + DailyLedger), cache, gateway
-agents/       state, lead orchestrator, 4 specialists, worker, LangGraph wiring
-retrieval/    tree-sitter chunker, Chroma indexer, hybrid search
-tools/        diff parsing, MCP clients, Repo Index MCP server
-eval/         harness, scoring, report generation
-frontend/     React + Vite client
-scripts/      development and verification scripts
-```
+Two servers consumed, one authored.
+
+| Server | Role |
+|---|---|
+| GitHub MCP (official) | PR fetch, diffs, files, review comments |
+| Filesystem MCP (official) | Reading the cloned repo |
+| **Repo Index MCP (authored)** | `search_code`, `find_callers`, `get_definition` |
+
+The Repo Index server wraps the retrieval layer: tree-sitter chunking on
+function and class boundaries, MiniLM embeddings in ChromaDB, and hybrid search
+merging vector similarity with ripgrep exact-match via reciprocal rank fusion.
+Pure vector search is poor at exact symbol lookup; the hybrid is meaningfully
+better for the cost of an afternoon.
+
+All three bind into LangGraph through `langchain-mcp-adapters`. No direct GitHub
+REST calls remain in the codebase.
+
+---
+
+## Stack
+
+**Backend** — Python, LangGraph, FastAPI, Pydantic, ChromaDB, tree-sitter,
+sentence-transformers, semgrep, ruff
+
+**Models** — Groq `gpt-oss-120b` (orchestration, specialists) and `gpt-oss-20b`
+(workers, formatting)
+
+**Frontend** — React, Vite, server-sent events
 
 ---
 
@@ -151,53 +178,58 @@ scripts/      development and verification scripts
 ```bash
 git clone https://github.com/Kushagra-Mishra1008/review_swarm
 cd review_swarm
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Set your API credentials:
+Create `.env`:
 
-```bash
-export GROQ_API_KEY=...
-export GITHUB_TOKEN=...
+```
+GROQ_API_KEY=your_key
+GITHUB_PERSONAL_ACCESS_TOKEN=your_token
 ```
 
-Index a repository, then review a pull request:
+Docker must be running — the GitHub MCP server runs in a container.
+
+**Verify the gateway** (no agents, minimal tokens):
 
 ```bash
-python -m retrieval.index --repo /path/to/repo
-python -m agents.run --pr <owner>/<repo>#<number>
+python scripts/test_gateway.py
 ```
 
-Run the frontend:
+**Run the app:**
 
 ```bash
+uvicorn backend.main:app --port 8000
 cd frontend && npm install && npm run dev
 ```
 
-Reproduce the evaluation:
+Paste a PR URL and watch the run. Replay a recorded run with no tokens and no
+network:
+
+```
+http://localhost:5173/?replay=<run_id>
+```
+
+**Reproduce the evaluation:**
 
 ```bash
-python -m eval.run --prs 19 --baseline
+python -m eval.collect --owner scikit-learn --repo scikit-learn --count 30
+python -m eval.runner
+python -m eval.report
 ```
 
 ---
 
-## Limitations
+## Repository layout
 
-Stated plainly, because they're the honest state of the project:
-
-- **Recall is low** (2.2%), below the single-agent baseline. The architecture optimizes precision, not coverage.
-- **More expensive than the baseline** — 3,168 vs 1,196 tokens per review. The multi-agent design has to earn that premium, and on recall it currently doesn't.
-- **Evaluated on 19 PRs**, short of the 30–50 target. Small sample; the precision gap is directionally clear but not tightly bounded.
-- **Python only** — tree-sitter chunking is not yet wired for other languages.
-- **Retry backoff is flat, not exponential**, despite variable naming that implies otherwise.
-- **MCP path is ~2.7× slower** than direct calls due to container startup overhead.
-- Single evaluation corpus (scikit-learn), so findings may not generalize across project conventions.
-
-## Next
-
-- Widen the eval corpus to 30–50 PRs across multiple repositories
-- Investigate the recall gap — likely a specialist-activation tuning problem rather than a model-capability one
-- Fix the retry backoff to be genuinely exponential
-- Multi-language tree-sitter support
-- Error tracking and metrics dashboards for run observability
+```
+core/            LLMGateway, token bucket, daily ledger, disk cache, model routing
+retrieval/       tree-sitter chunker, ChromaDB indexer, hybrid search
+agents/          lead, four specialists, worker, LangGraph wiring, shared state
+tools/           diff parsing, static analysis, GitHub MCP client
+mcp_servers/     authored Repo Index MCP server
+eval/            PR collection, run harness, scoring, reporting
+backend/         FastAPI, SSE event bus, run recordings
+frontend/        React UI — agent graph, event stream, findings, budget bar
+```
