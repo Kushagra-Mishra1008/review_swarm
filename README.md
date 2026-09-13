@@ -148,8 +148,6 @@ scripts/      development and verification scripts
 
 ## Running it
 
-<!-- TODO: verify these commands against the actual repo before publishing — env var names and entry points in particular. -->
-
 ```bash
 git clone https://github.com/Kushagra-Mishra1008/review_swarm
 cd review_swarm
