@@ -7,6 +7,12 @@ so this WILL be interrupted and re-run repeatedly, not run in one sitting.
 Stops gracefully (not with an error) if the daily token budget is close
 to exhausted, so a scheduled/manual re-run tomorrow just picks up where
 today left off.
+
+Token accounting is per-PR: the ledger's cumulative day total is sampled
+before and after each swarm run and the difference recorded. Recording
+the raw cumulative figure (as an earlier version did) makes every PR
+after the first look progressively more expensive and renders
+mean_tokens_per_review meaningless.
 """
 
 import asyncio
@@ -14,7 +20,8 @@ import json
 import os
 
 from agents.graph import run_review
-from core.config import DAILY_LEDGER_SOFT_LIMIT_FRACTION, MODEL_120B, MODEL_LIMITS
+from agents.worker import WORKER_ERRORS
+from core.config import DAILY_LEDGER_SOFT_LIMIT_FRACTION, MODEL_120B, MODEL_20B, MODEL_LIMITS
 from core.gateway import GatewayError, LLMGateway
 from core.models import TaskType
 from eval.collect import load_cached_prs
@@ -69,6 +76,15 @@ def _save_result(pr_number: int, result: dict) -> None:
         json.dump(result, f, indent=2)
 
 
+def _ledger_snapshot(gateway: LLMGateway) -> dict:
+    """Cumulative tokens spent today, per model. Differenced around a run
+    to get that run's actual cost."""
+    return {
+        MODEL_120B: gateway._ledger.spent_today(MODEL_120B),
+        MODEL_20B: gateway._ledger.spent_today(MODEL_20B),
+    }
+
+
 def _budget_headroom_remaining(gateway: LLMGateway) -> bool:
     """
     True if there's meaningful room left in today's 120b budget. Stops
@@ -86,6 +102,11 @@ async def run_baseline(pr_record: dict, gateway: LLMGateway) -> dict:
     Single-agent baseline: one LLM call, whole diff, no hierarchy, no
     retrieval, no static analysis. This is the plan's explicit "does the
     architecture earn itself" comparison point.
+
+    Note for the writeup: this baseline sees each file truncated to
+    BASELINE_MAX_CHARS_PER_FILE, while the swarm sees full hunks plus
+    retrieval context. The comparison is not like-for-like and should be
+    reported with that caveat.
     """
     files_meta = pr_record.get("files_meta", [])
     parts = []
@@ -120,11 +141,15 @@ async def run_baseline(pr_record: dict, gateway: LLMGateway) -> dict:
     }
 
 
-async def run_eval_batch(gateway: LLMGateway | None = None) -> dict:
+async def run_eval_batch(gateway: LLMGateway | None = None, force: bool = False) -> dict:
     """
     Iterates every cached PR (from eval/collect.py), runs the swarm +
     baseline on any not already scored, saves results incrementally.
     Stops early (not an error) if the daily token budget gets tight.
+
+    force=True re-runs PRs that already have a result on disk. Needed
+    after a bug fix invalidates previously saved results — cached
+    gateway responses mean this is far cheaper than the first run.
 
     Returns a summary: {"scored": [...], "skipped_budget": [...],
     "already_done": [...]}
@@ -137,7 +162,7 @@ async def run_eval_batch(gateway: LLMGateway | None = None) -> dict:
     for pr_record in prs:
         pr_number = pr_record["pr_number"]
 
-        if _load_result(pr_number) is not None:
+        if not force and _load_result(pr_number) is not None:
             already_done.append(pr_number)
             continue
 
@@ -145,34 +170,60 @@ async def run_eval_batch(gateway: LLMGateway | None = None) -> dict:
             skipped_budget.append(pr_number)
             continue
 
+        WORKER_ERRORS.clear()
+        before = _ledger_snapshot(gateway)
+
         try:
             swarm_state = await run_review(pr_record["pr_url"], gateway=gateway)
         except GatewayError as e:
             print(f"PR #{pr_number}: swarm run failed ({e}), skipping")
             continue
 
+        after = _ledger_snapshot(gateway)
+        swarm_tokens_120b = after[MODEL_120B] - before[MODEL_120B]
+        swarm_tokens_20b = after[MODEL_20B] - before[MODEL_20B]
+
+        swarm_findings = swarm_state.get("final_findings", [])
+        swarm_errors = list(swarm_state.get("errors", [])) + [dict(e) for e in WORKER_ERRORS]
+
         baseline_result = await run_baseline(pr_record, gateway)
 
         result = {
             "pr_number": pr_number,
             "pr_url": pr_record["pr_url"],
-            "swarm_findings": swarm_state.get("final_findings", []),
-            "swarm_tokens": gateway._ledger.spent_today(MODEL_120B),  # cumulative, refined in score.py
+            "swarm_findings": swarm_findings,
+            "swarm_tokens": swarm_tokens_120b + swarm_tokens_20b,
+            "swarm_tokens_120b": swarm_tokens_120b,
+            "swarm_tokens_20b": swarm_tokens_20b,
+            "swarm_errors": swarm_errors,
             "baseline_findings": baseline_result["findings"],
             "baseline_tokens": baseline_result["tokens"],
             "human_review_comments": pr_record.get("review_comments", []),
         }
         _save_result(pr_number, result)
         scored.append(pr_number)
-        print(f"PR #{pr_number}: scored ({len(result['swarm_findings'])} swarm findings, "
-              f"{len(result['baseline_findings'])} baseline findings)")
+        print(
+            f"PR #{pr_number}: scored ({len(swarm_findings)} swarm findings, "
+            f"{len(baseline_result['findings'])} baseline findings, "
+            f"{swarm_tokens_120b + swarm_tokens_20b} swarm tokens, "
+            f"{len(swarm_errors)} errors)"
+        )
 
     return {"scored": scored, "skipped_budget": skipped_budget, "already_done": already_done}
 
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Run swarm + baseline over collected PRs")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run PRs that already have saved results (use after a bug fix)",
+    )
+    args = parser.parse_args()
+
     gateway = LLMGateway()
-    summary = await run_eval_batch(gateway)
+    summary = await run_eval_batch(gateway, force=args.force)
     print(f"\nScored this run: {len(summary['scored'])}")
     print(f"Skipped (budget): {len(summary['skipped_budget'])}")
     print(f"Already done: {len(summary['already_done'])}")

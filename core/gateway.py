@@ -21,6 +21,15 @@ Every agent call goes through here. This class owns:
   calls) would leave the frontend's budget bar stuck at whatever it
   last saw, since cache_hit used to carry no budget info at all.
 
+Empty-content handling: gpt-oss models emit reasoning tokens that do
+not appear in choice.message.content. When a generation exhausts
+max_tokens before emitting the answer, content comes back as None or
+"" with finish_reason="length". Previously that empty string was
+returned verbatim, so callers got a confusing JSONDecodeError at
+"line 1 column 1" instead of a truncation signal. Now an empty
+completion is retried once with a larger max_tokens, and if it is
+still empty the gateway raises GatewayError naming finish_reason.
+
 If you ever see `client.chat.completions.create(...)` outside this file,
 the design is broken.
 """
@@ -45,6 +54,12 @@ from core.models import TaskType, resolve_model
 from core.run_context import current_run_id
 
 MAX_CONCURRENT_CALLS = 2
+
+# When a completion comes back empty because it ran out of room, retry
+# once with this multiplier applied to max_tokens. One retry only — a
+# second empty response means something other than truncation.
+EMPTY_RETRY_TOKEN_MULTIPLIER = 2.5
+EMPTY_RETRY_TOKEN_CEILING = 2000
 
 
 class GatewayError(Exception):
@@ -116,6 +131,10 @@ class LLMGateway:
         actual_tokens = response["usage"]["total_tokens"]
         self._bucket.record_usage(model, actual_tokens)
         self._ledger.record(model, actual_tokens)
+
+        if self._is_empty(response):
+            response = self._retry_empty(model, messages, params, full_text)
+
         self._cache.set(model, messages, params, response)
 
         _publish("llm_call_complete", {
@@ -163,9 +182,15 @@ class LLMGateway:
 
             response = await asyncio.to_thread(self._call_with_retry, model, messages, params)
 
-        actual_tokens = response["usage"]["total_tokens"]
-        self._bucket.record_usage(model, actual_tokens)
-        self._ledger.record(model, actual_tokens)
+            actual_tokens = response["usage"]["total_tokens"]
+            self._bucket.record_usage(model, actual_tokens)
+            self._ledger.record(model, actual_tokens)
+
+            if self._is_empty(response):
+                response = await asyncio.to_thread(
+                    self._retry_empty, model, messages, params, full_text
+                )
+
         self._cache.set(model, messages, params, response)
 
         _publish("llm_call_complete", {
@@ -175,6 +200,56 @@ class LLMGateway:
         })
 
         return {**response, "cached": False}
+
+    @staticmethod
+    def _is_empty(response: dict) -> bool:
+        content = response.get("content")
+        return content is None or not str(content).strip()
+
+    def _retry_empty(self, model: str, messages: list[dict], params: dict, full_text: str) -> dict:
+        """
+        A completion came back with no content. On gpt-oss this nearly
+        always means the reasoning trace consumed the whole max_tokens
+        budget before any answer was emitted — finish_reason will be
+        "length". Retry once with a bigger ceiling; if it is still empty,
+        raise rather than handing an empty string to a JSON parser.
+        """
+        original_max = params["max_tokens"]
+        bigger = min(int(original_max * EMPTY_RETRY_TOKEN_MULTIPLIER), EMPTY_RETRY_TOKEN_CEILING)
+
+        _publish("empty_completion_retry", {
+            "model": model,
+            "from_max_tokens": original_max,
+            "to_max_tokens": bigger,
+        })
+
+        if bigger <= original_max:
+            raise GatewayError(
+                f"Empty completion from {model} at max_tokens={original_max} "
+                f"and no headroom left to retry."
+            )
+
+        retry_params = {**params, "max_tokens": bigger}
+        estimated = _estimate_tokens(full_text, bigger)
+
+        self._ledger.check_budget(model, estimated)
+        self._bucket.wait_if_needed(model, estimated)
+
+        response = self._call_with_retry(model, messages, retry_params)
+
+        actual_tokens = response["usage"]["total_tokens"]
+        self._bucket.record_usage(model, actual_tokens)
+        self._ledger.record(model, actual_tokens)
+
+        if self._is_empty(response):
+            raise GatewayError(
+                f"Empty completion from {model} twice "
+                f"(max_tokens {original_max} then {bigger}, "
+                f"finish_reason={response.get('finish_reason')}). "
+                f"The model is producing reasoning tokens but no answer."
+            )
+
+        return response
 
     @staticmethod
     def _build_request(
@@ -214,6 +289,7 @@ class LLMGateway:
                 choice = completion.choices[0]
                 return {
                     "content": choice.message.content,
+                    "finish_reason": getattr(choice, "finish_reason", None),
                     "usage": {
                         "prompt_tokens": completion.usage.prompt_tokens,
                         "completion_tokens": completion.usage.completion_tokens,

@@ -7,6 +7,10 @@ File selection sees actual code content (via build_file_preview), not
 just file paths — selecting by filename alone misses real issues in
 plainly-named files and over-selects files that just sound relevant.
 
+An empty selection is treated the same as a failed one: scan everything.
+A specialist that declines to pick any file produces a silent
+zero-finding review, which is indistinguishable from a clean PR.
+
 Both sync (performance_specialist) and async (aperformance_specialist)
 versions exist — async is used in Phase 3+ when all four specialists
 fan out concurrently via asyncio.gather.
@@ -46,7 +50,8 @@ SELECT_SYSTEM_PROMPT = (
     "name — base your selection on what the code does, never on the "
     "file name alone. Select every file with a real performance-relevant "
     "change; skip files with no runtime-impacting logic, like pure "
-    "documentation or static config."
+    "documentation or static config. Prefer selecting too many files "
+    "over selecting none."
 )
 
 SELECT_SCHEMA_PROMPT = (
@@ -55,7 +60,9 @@ SELECT_SCHEMA_PROMPT = (
     "files_to_scan must be a subset of the file paths shown to you. Include "
     "a file if it contains queries/expensive calls inside loops, blocking "
     "sleeps or I/O in a hot path, unbounded queries, or unnecessary repeated "
-    "computation."
+    "computation. "
+    "Only return an empty list if every file shown is pure documentation, "
+    "configuration, or data with no executable code at all."
 )
 
 SELECT_FEW_SHOT = (
@@ -107,8 +114,13 @@ async def aperformance_specialist(state: ReviewState, gateway: LLMGateway) -> di
     if not state["files"]:
         return {"findings": []}
 
+    all_paths = [f["file_path"] for f in state["files"]]
     selection = await _acall_file_selection(gateway, state["files"])
-    selected_paths = _resolve_selected_paths(selection, [f["file_path"] for f in state["files"]])
+    selected_paths = _resolve_selected_paths(selection, all_paths)
+
+    fell_back = selection is None or not [
+        p for p in selection.files_to_scan if p in all_paths
+    ]
 
     file_lookup = {f["file_path"]: f for f in state["files"]}
     static_by_file = state.get("static_findings_by_file", {})
@@ -129,16 +141,26 @@ async def aperformance_specialist(state: ReviewState, gateway: LLMGateway) -> di
     for worker_findings in results:
         findings.extend(_tag_findings(worker_findings))
 
+    diag = f"[diag] performance selected files: {selected_paths}"
+    if fell_back:
+        diag += " (fell back to all files — selection was empty or failed)"
+
     return {
         "findings": findings,
-        "errors": [f"[diag] performance selected files: {selected_paths}"],
+        "errors": [diag],
     }
 
 
 def _resolve_selected_paths(selection: FileSelection | None, file_paths: list[str]) -> list[str]:
+    """
+    Falls back to every file when selection failed (None) OR came back
+    empty. An empty selection means no workers spawn, which reports as
+    "no issues found" — a false clean bill of health.
+    """
     if selection is None:
         return file_paths
-    return [p for p in selection.files_to_scan if p in file_paths]
+    resolved = [p for p in selection.files_to_scan if p in file_paths]
+    return resolved or file_paths
 
 
 def _tag_findings(findings: list[Finding]) -> list[Finding]:
@@ -157,7 +179,7 @@ def _call_file_selection(gateway: LLMGateway, files: list, retry_note: str = "")
         schema_prompt=SELECT_SCHEMA_PROMPT,
         few_shot=SELECT_FEW_SHOT,
         variable_content=variable_content,
-        max_tokens=300,
+        max_tokens=600,
     )
 
     try:
@@ -182,7 +204,7 @@ async def _acall_file_selection(gateway: LLMGateway, files: list, retry_note: st
         schema_prompt=SELECT_SCHEMA_PROMPT,
         few_shot=SELECT_FEW_SHOT,
         variable_content=variable_content,
-        max_tokens=300,
+        max_tokens=600,
     )
 
     try:

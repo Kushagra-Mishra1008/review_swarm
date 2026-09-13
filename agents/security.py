@@ -9,6 +9,10 @@ issues in files with unassuming names (e.g. a hardcoded key in
 "notifications.py") while over-selecting files that just sound
 security-adjacent by name.
 
+An empty selection is treated the same as a failed one: scan everything.
+A specialist that declines to pick any file produces a silent
+zero-finding review, which is indistinguishable from a clean PR.
+
 Both sync (security_specialist) and async (asecurity_specialist)
 versions exist — async is used in Phase 3+ when all four specialists
 fan out concurrently via asyncio.gather.
@@ -50,7 +54,7 @@ SELECT_SYSTEM_PROMPT = (
     "secret; a file named 'validators.py' can be entirely clean. Select "
     "every file with a real security-relevant change; skip files with "
     "no security-relevant logic, like pure documentation or config "
-    "formatting."
+    "formatting. Prefer selecting too many files over selecting none."
 )
 
 SELECT_SCHEMA_PROMPT = (
@@ -58,7 +62,9 @@ SELECT_SCHEMA_PROMPT = (
     '{"files_to_scan": ["path/to/file.py"], "reasoning": "one sentence"}\n'
     "files_to_scan must be a subset of the file paths shown to you. Include "
     "a file if it contains hardcoded secrets/keys, raw SQL built with string "
-    "formatting, unsafe deserialization, or missing auth/authz checks."
+    "formatting, unsafe deserialization, or missing auth/authz checks. "
+    "Only return an empty list if every file shown is pure documentation, "
+    "configuration, or data with no executable code at all."
 )
 
 SELECT_FEW_SHOT = (
@@ -107,8 +113,13 @@ async def asecurity_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
     if not state["files"]:
         return {"findings": []}
 
+    all_paths = [f["file_path"] for f in state["files"]]
     selection = await _acall_file_selection(gateway, state["files"])
-    selected_paths = _resolve_selected_paths(selection, [f["file_path"] for f in state["files"]])
+    selected_paths = _resolve_selected_paths(selection, all_paths)
+
+    fell_back = selection is None or not [
+        p for p in selection.files_to_scan if p in all_paths
+    ]
 
     file_lookup = {f["file_path"]: f for f in state["files"]}
     static_by_file = state.get("static_findings_by_file", {})
@@ -129,53 +140,26 @@ async def asecurity_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
     for worker_findings in results:
         findings.extend(_tag_findings(worker_findings))
 
-    return {
-        "findings": findings,
-        "errors": [f"[diag] security selected files: {selected_paths}"],
-    }
-
-
-async def asecurity_specialist(state: ReviewState, gateway: LLMGateway) -> dict:
-    """
-    Async version — selects files (one LLM call, now with real code
-    content), then scans every selected file CONCURRENTLY via
-    asyncio.gather. Each ascan_file call queues behind the gateway's
-    semaphore, so real network concurrency stays capped.
-    """
-    if not state["files"]:
-        return {"findings": []}
-
-    selection = await _acall_file_selection(gateway, state["files"])
-    selected_paths = _resolve_selected_paths(selection, [f["file_path"] for f in state["files"]])
-
-    file_lookup = {f["file_path"]: f for f in state["files"]}
-    static_by_file = state.get("static_findings_by_file", {})
-
-    tasks = [
-        ascan_file(
-            file_lookup[path],
-            gateway,
-            focus_hint=SECURITY_FOCUS_HINT,
-            static_findings=static_by_file.get(path),
-        )
-        for path in selected_paths
-    ]
-    results = await asyncio.gather(*tasks) if tasks else []
-
-    findings: list[Finding] = []
-    for worker_findings in results:
-        findings.extend(_tag_findings(worker_findings))
+    diag = f"[diag] security selected files: {selected_paths}"
+    if fell_back:
+        diag += " (fell back to all files — selection was empty or failed)"
 
     return {
         "findings": findings,
-        "errors": [f"[diag] security selected files: {selected_paths}"],
+        "errors": [diag],
     }
 
 
 def _resolve_selected_paths(selection: FileSelection | None, file_paths: list[str]) -> list[str]:
+    """
+    Falls back to every file when selection failed (None) OR came back
+    empty. An empty selection means no workers spawn, which reports as
+    "no issues found" — a false clean bill of health.
+    """
     if selection is None:
-        return file_paths  # fall back to scanning everything on parse failure
-    return [p for p in selection.files_to_scan if p in file_paths]
+        return file_paths
+    resolved = [p for p in selection.files_to_scan if p in file_paths]
+    return resolved or file_paths
 
 
 def _tag_findings(findings: list[Finding]) -> list[Finding]:
@@ -194,7 +178,7 @@ def _call_file_selection(gateway: LLMGateway, files: list, retry_note: str = "")
         schema_prompt=SELECT_SCHEMA_PROMPT,
         few_shot=SELECT_FEW_SHOT,
         variable_content=variable_content,
-        max_tokens=300,
+        max_tokens=600,
     )
 
     try:
@@ -219,7 +203,7 @@ async def _acall_file_selection(gateway: LLMGateway, files: list, retry_note: st
         schema_prompt=SELECT_SCHEMA_PROMPT,
         few_shot=SELECT_FEW_SHOT,
         variable_content=variable_content,
-        max_tokens=300,
+        max_tokens=600,
     )
 
     try:
