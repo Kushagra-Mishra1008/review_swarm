@@ -1,0 +1,360 @@
+{
+  "pr_count": 19,
+  "summary": {
+    "swarm": {
+      "mean_recall": 0.021929824561403508,
+      "mean_precision": 0.17142857142857143,
+      "mean_tokens_per_review": 3167.9444444444443
+    },
+    "baseline": {
+      "mean_recall": 0.06261428218433407,
+      "mean_precision": 0.09837092731829573,
+      "mean_tokens_per_review": 1196.3684210526317
+    }
+  },
+  "novel_findings_for_manual_review": [
+    {
+      "pr_number": 33906,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33906",
+      "file": "sklearn/utils/tests/test_array_api.py",
+      "line": 33,
+      "severity": "major",
+      "category": "bug",
+      "message": "The test imports and uses a function named `_swapaxes`, but the array\u2011api utilities expose the function as `swapaxes`. If `_swapaxes` is not defined, the test will raise an ImportError or NameError.",
+      "suggested_fix": "Replace `_swapaxes` with the correct function name `swapaxes`, or ensure that `_swapaxes` is properly defined and exported in the module being tested.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 33959,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33959",
+      "file": "sklearn/utils/validation.py",
+      "line": 44,
+      "severity": "blocker",
+      "category": "bug",
+      "message": "The function `_nw_is_into_df_or_series` is defined without a body, which will raise an `IndentationError` or `SyntaxError` when the module is imported.",
+      "suggested_fix": "Provide a proper implementation for `_nw_is_into_df_or_series`, e.g.:\n```python\ndef _nw_is_into_df_or_series(x):\n    return isinstance(x, (nw.DataFrame, nw.Series))\n```",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 33959,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33959",
+      "file": "sklearn/model_selection/tests/test_search.py",
+      "line": 827,
+      "severity": "major",
+      "category": "missing_import",
+      "message": "pytest is used for parametrize but not imported.",
+      "suggested_fix": "Add `import pytest` at the top of the file.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 33959,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33959",
+      "file": "sklearn/model_selection/tests/test_search.py",
+      "line": 850,
+      "severity": "major",
+      "category": "missing_import",
+      "message": "GridSearchCV is used but not imported.",
+      "suggested_fix": "Add `from sklearn.model_selection import GridSearchCV` at the top of the file.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 33959,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33959",
+      "file": "sklearn/model_selection/tests/test_search.py",
+      "line": 851,
+      "severity": "major",
+      "category": "missing_import",
+      "message": "numpy is used as np but not imported.",
+      "suggested_fix": "Add `import numpy as np` at the top of the file.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34096,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34096",
+      "file": "sklearn/callback/_callback_context.py",
+      "line": 510,
+      "severity": "major",
+      "category": "bug",
+      "message": "`callbacks_to_propagate` may be `None` or an empty list; concatenating with `curr_callbacks` using `+` will raise a `TypeError` if either operand is `None`.",
+      "suggested_fix": "Add a guard to convert `None` to an empty list before concatenation, e.g. `callbacks_to_propagate = callbacks_to_propagate or []` and similarly for `curr_callbacks`. Ensure the resulting list is passed to `_set_callbacks`. ",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34096,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34096",
+      "file": "sklearn/callback/_callback_context.py",
+      "line": 521,
+      "severity": "major",
+      "category": "bug",
+      "message": "`kept_callbacks` may be `None`; passing it directly to `_set_callbacks` can cause a `TypeError` or unintended behavior.",
+      "suggested_fix": "Validate `kept_callbacks` before calling `_set_callbacks`, converting `None` to an empty list or raising a clear error if the state is invalid. ",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34096,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34096",
+      "file": "sklearn/callback/_callback_context.py",
+      "line": 510,
+      "severity": "minor",
+      "category": "bug",
+      "message": "Potential TypeError: curr_callbacks or callbacks_to_propagate may be None, causing list concatenation to fail.",
+      "suggested_fix": "Ensure both curr_callbacks and callbacks_to_propagate are lists before concatenation, e.g., use `curr_callbacks or []` and `callbacks_to_propagate or []`.",
+      "source_agent": "maintainability_specialist"
+    },
+    {
+      "pr_number": 34452,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34452",
+      "file": "sklearn/utils/tests/test_encode.py",
+      "line": 168,
+      "severity": "blocker",
+      "category": "bug",
+      "message": "Missing closing parenthesis in the call to _encode, causing a syntax error.",
+      "suggested_fix": "Add the missing closing parenthesis after the True argument: _encode(values, uniques=np.array([\"a\", \"c\"], dtype=object), return_diff=True)",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34514,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34514",
+      "file": "sklearn/linear_model/tests/test_coordinate_descent.py",
+      "line": 144,
+      "severity": "minor",
+      "category": "test",
+      "message": "The test calls cd_fast.enet_coordinate_descent_sparse but does not assert any result, so it will always pass regardless of function correctness.",
+      "suggested_fix": "Add assertions to verify the returned coefficients, objective value, or convergence status.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34514,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34514",
+      "file": "sklearn/linear_model/tests/test_coordinate_descent.py",
+      "line": 199,
+      "severity": "minor",
+      "category": "test",
+      "message": "The test invokes cd_fast.enet_coordinate_descent_sparse without checking for edge cases such as empty input or None values, potentially missing error handling paths.",
+      "suggested_fix": "Add test cases that pass empty arrays or None to ensure the function raises appropriate exceptions or handles them gracefully.",
+      "source_agent": "testing_specialist"
+    },
+    {
+      "pr_number": 34572,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34572",
+      "file": "sklearn/linear_model/_coordinate_descent.py",
+      "line": 729,
+      "severity": "blocker",
+      "category": "bug",
+      "message": "Division by X_scale may raise ZeroDivisionError or TypeError if X_scale is None or zero. X_sparse_scaling is used later as X_mean, causing NameError when X_offset is None.",
+      "suggested_fix": "Add a guard: if X_offset is not None and X_scale is not None and X_scale != 0: X_sparse_scaling = np.asarray(X_offset / X_scale, dtype=X.dtype) else: X_sparse_scaling = None. Ensure X_scale is validated before division.",
+      "source_agent": "testing_specialist"
+    }
+  ],
+  "per_pr": [
+    {
+      "pr_number": 33633,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33633",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": null,
+      "baseline_tokens": 1274,
+      "human_comment_count": 2
+    },
+    {
+      "pr_number": 33906,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33906",
+      "swarm_recall": 0.0,
+      "swarm_precision": 0.0,
+      "baseline_recall": 0.056338028169014086,
+      "baseline_precision": 0.2857142857142857,
+      "swarm_tokens": 6386,
+      "baseline_tokens": 1851,
+      "human_comment_count": 71
+    },
+    {
+      "pr_number": 33959,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/33959",
+      "swarm_recall": 0.16666666666666666,
+      "swarm_precision": 0.2,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 3384,
+      "baseline_tokens": 1199,
+      "human_comment_count": 12
+    },
+    {
+      "pr_number": 34084,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34084",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 1935,
+      "baseline_tokens": 643,
+      "human_comment_count": 14
+    },
+    {
+      "pr_number": 34096,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34096",
+      "swarm_recall": 0.0,
+      "swarm_precision": 0.0,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 4134,
+      "baseline_tokens": 1315,
+      "human_comment_count": 4
+    },
+    {
+      "pr_number": 34242,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34242",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 2633,
+      "baseline_tokens": 796,
+      "human_comment_count": 2
+    },
+    {
+      "pr_number": 34246,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34246",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 2726,
+      "baseline_tokens": 1660,
+      "human_comment_count": 5
+    },
+    {
+      "pr_number": 34412,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34412",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 7707,
+      "baseline_tokens": 2243,
+      "human_comment_count": 27
+    },
+    {
+      "pr_number": 34442,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34442",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.05,
+      "baseline_precision": 0.25,
+      "swarm_tokens": 5083,
+      "baseline_tokens": 1388,
+      "human_comment_count": 20
+    },
+    {
+      "pr_number": 34452,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34452",
+      "swarm_recall": 0.0,
+      "swarm_precision": 0.0,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 3417,
+      "baseline_tokens": 1302,
+      "human_comment_count": 13
+    },
+    {
+      "pr_number": 34480,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34480",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.25,
+      "baseline_precision": 0.5,
+      "swarm_tokens": 1444,
+      "baseline_tokens": 823,
+      "human_comment_count": 4
+    },
+    {
+      "pr_number": 34514,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34514",
+      "swarm_recall": 0.0,
+      "swarm_precision": 0.0,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 3063,
+      "baseline_tokens": 1359,
+      "human_comment_count": 5
+    },
+    {
+      "pr_number": 34539,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34539",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 1140,
+      "baseline_tokens": 534,
+      "human_comment_count": 7
+    },
+    {
+      "pr_number": 34556,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34556",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 1099,
+      "baseline_tokens": 554,
+      "human_comment_count": 5
+    },
+    {
+      "pr_number": 34572,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34572",
+      "swarm_recall": 0.0,
+      "swarm_precision": 0.0,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 1942,
+      "baseline_tokens": 990,
+      "human_comment_count": 7
+    },
+    {
+      "pr_number": 34586,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34586",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.16666666666666666,
+      "baseline_precision": 0.3333333333333333,
+      "swarm_tokens": 1508,
+      "baseline_tokens": 857,
+      "human_comment_count": 6
+    },
+    {
+      "pr_number": 34590,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34590",
+      "swarm_recall": 0.25,
+      "swarm_precision": 1.0,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 1307,
+      "baseline_tokens": 628,
+      "human_comment_count": 4
+    },
+    {
+      "pr_number": 34594,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34594",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.6666666666666666,
+      "baseline_precision": 0.5,
+      "swarm_tokens": 2730,
+      "baseline_tokens": 1030,
+      "human_comment_count": 3
+    },
+    {
+      "pr_number": 34632,
+      "pr_url": "https://github.com/scikit-learn/scikit-learn/pull/34632",
+      "swarm_recall": 0.0,
+      "swarm_precision": null,
+      "baseline_recall": 0.0,
+      "baseline_precision": 0.0,
+      "swarm_tokens": 5385,
+      "baseline_tokens": 2285,
+      "human_comment_count": 2
+    }
+  ]
+}

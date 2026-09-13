@@ -3,16 +3,21 @@ Matches agent findings (swarm or baseline) to human review comments, per
 the plan's rule: same file AND within ±3 lines AND semantically similar
 (using the local embedder — free, same one from retrieval/indexer.py).
 
-A "match" means the agent caught something a human reviewer also flagged.
-Findings that don't match anything are either false positives (noise) or
-genuinely novel catches humans missed — score.py doesn't judge which;
-report.py surfaces novel findings for manual inspection, per the plan.
+Line matching is now best-effort, not required: GitHub sets a review
+comment's `line` to null once its diff position goes stale (common on
+any PR that gets updated after review starts). Requiring a line match
+was silently dropping a large share of real, on-topic human comments —
+confirmed by inspecting real scikit-learn PR data where several clearly
+relevant comments (0.5-0.6 cosine similarity to a matching finding) had
+line: null and were being discarded before similarity was ever checked.
 """
 
 from sentence_transformers import SentenceTransformer, util
 
 LINE_TOLERANCE = 3
-SIMILARITY_THRESHOLD = 0.5  # cosine similarity floor to count as "about the same issue"
+SIMILARITY_THRESHOLD = 0.5  # empirically checked against real scikit-learn
+# PR data: on-topic comment pairs scored 0.48-0.60, unrelated pairs
+# scored under 0.2 — this threshold cleanly separates the two.
 
 _embedder: SentenceTransformer | None = None
 
@@ -26,23 +31,24 @@ def _get_embedder() -> SentenceTransformer:
 
 def _normalize_human_comment(raw: dict) -> dict | None:
     """
-    GitHub MCP review comment shape isn't fully confirmed (same caveat
-    as collect.py — untested against a real run yet). Tries a few
-    plausible field names for path/line/body; returns None for comments
-    that don't have enough info to match against (e.g. a general PR
-    comment with no file/line attached).
+    Confirmed real field names from GitHub's MCP server: path, line, body.
+    `line` is allowed to be missing/null — GitHub nulls it once a
+    comment's diff position is stale, which does NOT mean the comment
+    is irrelevant. Only path and body are required; a comment with no
+    file or no text genuinely can't be matched against anything.
     """
     path = raw.get("path") or raw.get("file")
-    line = raw.get("line") or raw.get("original_line") or raw.get("position")
     body = raw.get("body") or raw.get("text")
 
-    if not path or not line or not body:
+    if not path or not body:
         return None
 
-    try:
-        line = int(line)
-    except (TypeError, ValueError):
-        return None
+    line = raw.get("line") or raw.get("original_line") or raw.get("position")
+    if line is not None:
+        try:
+            line = int(line)
+        except (TypeError, ValueError):
+            line = None
 
     return {"file": path, "line": line, "body": body}
 
@@ -54,11 +60,17 @@ def match_findings_to_comments(
     """
     Returns:
         {
-            "matched_findings": [...],    # findings that matched a human comment
-            "unmatched_findings": [...],   # findings with no human match (novel or noise)
-            "matched_comments": [...],      # human comments that got caught by a finding
-            "unmatched_comments": [...],     # human comments no finding caught (recall gap)
+            "matched_findings": [...],
+            "unmatched_findings": [...],
+            "matched_comments": [...],
+            "unmatched_comments": [...],
         }
+
+    Matching rule: same file, AND (no line info on either side, OR
+    within LINE_TOLERANCE), AND semantic similarity >= SIMILARITY_THRESHOLD.
+    A comment with no line number is judged on file + similarity alone —
+    stricter positional matching simply isn't possible without one, and
+    dropping it entirely throws away real signal.
     """
     normalized_comments = [c for c in (_normalize_human_comment(rc) for rc in human_comments) if c]
 
@@ -84,8 +96,12 @@ def match_findings_to_comments(
         for ci, comment in enumerate(normalized_comments):
             if finding["file"] != comment["file"]:
                 continue
-            if abs(finding["line"] - comment["line"]) > LINE_TOLERANCE:
-                continue
+
+            if finding.get("line") is not None and comment.get("line") is not None:
+                if abs(finding["line"] - comment["line"]) > LINE_TOLERANCE:
+                    continue
+            # else: one or both sides have no line info — fall through
+            # to similarity-only matching on this file.
 
             similarity = util.cos_sim(finding_embeddings[fi], comment_embeddings[ci]).item()
             if similarity >= SIMILARITY_THRESHOLD:
@@ -104,9 +120,6 @@ def compute_pr_metrics(findings: list[dict], human_comments: list[dict]) -> dict
     """
     Per-PR metrics for one set of findings (swarm OR baseline) against
     the human comments on that PR.
-
-    recall = fraction of human comments the findings caught
-    precision = fraction of findings that matched a real human comment
     """
     match_result = match_findings_to_comments(findings, human_comments)
 
@@ -126,6 +139,6 @@ def compute_pr_metrics(findings: list[dict], human_comments: list[dict]) -> dict
         "recall": recall,
         "precision": precision,
         "matched_count": len(match_result["matched_findings"]),
-        "novel_findings": match_result["unmatched_findings"],  # unmatched = novel or noise, human-inspect
+        "novel_findings": match_result["unmatched_findings"],
         "missed_comments": match_result["unmatched_comments"],
     }

@@ -9,7 +9,14 @@ path exists.
 import os
 import tempfile
 
+from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# Loaded here explicitly rather than relying on core/config.py's import
+# to have already happened — eval/collect.py imports this module
+# directly without ever importing core/config.py, so without this call
+# GITHUB_TOKEN would never actually get loaded from .env for that script.
+load_dotenv()
 
 
 def build_static_mcp_client() -> MultiServerMCPClient:
@@ -34,9 +41,6 @@ def build_static_mcp_client() -> MultiServerMCPClient:
                     "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
                     "ghcr.io/github/github-mcp-server",
                 ],
-                # Passed to the `docker` CLI process itself; docker then
-                # forwards GITHUB_PERSONAL_ACCESS_TOKEN into the container
-                # because the -e flag above names it without a value.
                 "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": github_token},
             },
             "filesystem": {
